@@ -102,8 +102,20 @@ const AI_ACTIONS = [
   { k: 'clean',  label: '読みやすく', kind: 'text', p: '次の文章を、内容を変えずに読みやすい日本語に整えてください。言っていないことは足さず、不要な繰り返しだけ減らし、段落に分けます。整えた本文だけを返してください。' },
   { k: 'points', label: '要点3行',   kind: 'text', p: '次の文章の要点を、短い3行にまとめてください。言っていないことは足しません。3行だけを返してください。' },
   { k: 'todo',   label: 'やること',   kind: 'text', p: '次の文章から、「やること」だけを箇条書きで抜き出してください。なければ「やることは見当たりません」とだけ返してください。' },
-  { k: 'title',  label: '題をつける', kind: 'title', p: '次の文章に、20文字以内の短い題を1つだけ付けてください。題だけを返してください。' }
+  { k: 'title',  label: '題をつける', kind: 'title', p: '次の文章に、20文字以内の短い題を1つだけ付けてください。題だけを返してください。' },
+  { k: 'table',  label: '表にする',   kind: 'table', p: '内容を表にして。Markdown の表だけを出力。1行目は見出し。数字は単位を付けず数字だけにする。前置きや説明は付けない。' },
+  { k: 'flow',   label: 'フローにする', kind: 'flow', p: '内容を流れ図にして。1行に「A -> B」の形で、矢印の線だけを出力する。最初は「開始」、最後は「終了」にする。分かれ道（判断）は「？」で終わる言葉にして、「判断？ -(はい)-> 次」「判断？ -(いいえ)-> 次」の形で書く。前置きや説明は付けない。' }
 ];
+const KIND_NAME = { memo: 'メモ', table: '表', flow: 'フロー' };
+// AIが付けがちな ``` の囲みや前置きを外して、表・フローの本文だけにする
+function cleanBlock(kind, t) {
+  let s = String(t || '').replace(/\r\n?/g, '\n').trim();
+  const m = s.match(/```[a-zA-Z]*\n([\s\S]*?)```/); if (m) s = m[1].trim();
+  s = s.replace(/^```[a-zA-Z]*\n?|\n?```$/g, '').trim();
+  if (kind === 'table') { const L = s.split('\n'); const i = L.findIndex(x => x.trim().startsWith('|')); if (i > 0) s = L.slice(i).join('\n').trim(); }
+  if (kind === 'flow') s = s.split('\n').filter(x => x.includes('->')).join('\n').trim();
+  return s;
+}
 function fmtDur(ms) { const s = Math.max(0, Math.round(ms / 1000)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
 function bufToB64(buf) {
   const u = new Uint8Array(buf); let s = '';
@@ -271,7 +283,7 @@ async function runAction(id, k) {
   const r = recs.find(x => x.id === id), a = AI_ACTIONS.find(x => x.k === k); if (!r || !a || aiBusy.has(id)) return;
   const text = readText(id); if (!text) return;
   aiBusy.add(id); previews[id] = null; render();
-  try { const out = await callAI(a.p + '\n\n' + text); previews[id] = { kind: a.kind, label: a.label, text: out }; }
+  try { const out = await callAI(a.p + '\n\n' + text); previews[id] = { kind: a.kind, label: a.label, text: (a.kind === 'table' || a.kind === 'flow') ? cleanBlock(a.kind, out) : out }; if (!previews[id].text) throw new Error('うまく作れませんでした。もう一度試してください'); }
   catch (e) { toast(e.message, true); }
   aiBusy.delete(id); render();
 }
@@ -286,12 +298,25 @@ async function runInstruction(id, blob) {
   } catch (e) { toast((e.message || String(e)) + '（指示の録音は残していません）', true); }
   aiBusy.delete(id); render();
 }
+async function sendBlock(id) {   // 表・フローの案を、種類つきで預ける（受け取り側: table-pad）。声の記録そのものは 'sent' にしない
+  const r = recs.find(x => x.id === id), pv = previews[id]; if (!r || !pv || (pv.kind !== 'table' && pv.kind !== 'flow')) return;
+  busy.add(id); render();
+  try {
+    const title = (r.title || '').trim() || titleFromText(readText(id));
+    const res = await api('/inbox', { method: 'POST', body: JSON.stringify({ text: pv.text, kind: pv.kind, title }) });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(errText(res.status, d.error, '預けること'));
+    previews[id] = null;
+    toast(KIND_NAME[pv.kind] + 'を預けました。table-pad を開くと入ります（起動・復帰のとき）');
+  } catch (e) { toast(e.message || String(e), true); }
+  busy.delete(id); render(true);
+}
 async function sendMemo(id) {
   const r = recs.find(x => x.id === id); if (!r) return;
   const body = composeMemo(r.title, readText(id)); if (!body) { toast('本文が空です', true); return; }
   busy.add(id); render();
   try {
-    const res = await api('/inbox', { method: 'POST', body: JSON.stringify({ text: body }) });
+    const res = await api('/inbox', { method: 'POST', body: JSON.stringify({ text: body, kind: 'memo' }) });
     const d = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(errText(res.status, d.error, '預けること'));
     r.text = readText(id); r.status = 'sent'; r.blob = null; r.error = ''; r.sentAt = Date.now();
@@ -324,7 +349,8 @@ function render(skipFlush) {   // skipFlush: 入力欄ではなく、データ�
       } else {
         h += '<input type="text" id="ti-' + r.id + '" data-ti="' + r.id + '" maxlength="60" placeholder="題（任意。メモの1行目になります）" value="' + esc(r.title || '') + '"' + (r.status === 'sent' ? ' disabled' : '') + '>';
         h += '<textarea id="ta-' + r.id + '" data-ta="' + r.id + '"' + (r.status === 'sent' ? ' readonly' : '') + '>' + esc(r.text) + '</textarea>';
-        if (pv) h += '<div class="prev"><b>' + esc(pv.label) + (pv.kind === 'title' ? '（題の案）' : '（案）') + '</b><div class="t">' + esc(pv.text) + '</div><div class="row"><button class="btn main" data-use="' + r.id + '">' + (pv.kind === 'title' ? '題にする' : '置き換える') + '</button>' + (pv.kind === 'text' ? '<button class="btn" data-add="' + r.id + '">下に足す</button>' : '') + '<button class="btn" data-drop="' + r.id + '">捨てる</button></div></div>';
+        if (pv && (pv.kind === 'table' || pv.kind === 'flow')) h += '<div class="prev"><b>' + esc(pv.label) + '（案）</b><pre class="t" style="white-space:pre-wrap;margin:6px 0">' + esc(pv.text) + '</pre><div class="row"><button class="btn main" data-pvsend="' + r.id + '"' + (isBusy ? ' disabled' : '') + '>' + (isBusy ? '<span class="spin"></span>預けています…' : 'table-pad へ預ける') + '</button><button class="btn" data-pvcopy="' + r.id + '">コピー</button><button class="btn" data-drop="' + r.id + '">捨てる</button></div></div>';
+        else if (pv) h += '<div class="prev"><b>' + esc(pv.label) + (pv.kind === 'title' ? '（題の案）' : '（案）') + '</b><div class="t">' + esc(pv.text) + '</div><div class="row"><button class="btn main" data-use="' + r.id + '">' + (pv.kind === 'title' ? '題にする' : '置き換える') + '</button>' + (pv.kind === 'text' ? '<button class="btn" data-add="' + r.id + '">下に足す</button>' : '') + '<button class="btn" data-drop="' + r.id + '">捨てる</button></div></div>';
         if (r.status === 'done') {
           h += '<div class="row">' + AI_ACTIONS.map(a => '<button class="btn" data-act="' + a.k + '" data-id2="' + r.id + '"' + (isAI ? ' disabled' : '') + '>' + a.label + '</button>').join('') +
             '<button class="btn" data-instr="' + r.id + '"' + (isAI || rec ? ' disabled' : '') + '>🎙 声で指示</button></div>';
@@ -351,6 +377,8 @@ document.addEventListener('click', async e => {
   else if (d.act) runAction(d.id2, d.act);
   else if (d.instr) startRec({ id: d.instr });
   else if (d.send) sendMemo(d.send);
+  else if (d.pvsend) sendBlock(d.pvsend);
+  else if (d.pvcopy) { const pv = previews[d.pvcopy]; if (pv) { try { await navigator.clipboard.writeText(pv.text); toast('コピーしました。table-pad の「📥 貼り付け」で入ります'); } catch (_) { toast('コピーできませんでした。文字を長押しして選んでください', true); } } }
   else if (d.copy) { const t = composeMemo((recs.find(x => x.id === d.copy) || {}).title, readText(d.copy)); try { await navigator.clipboard.writeText(t); toast('コピーしました'); } catch (_) { toast('コピーできませんでした。文字を長押しして選んでください', true); } }
   else if (d.del) { const r = recs.find(x => x.id === d.del); if (r && confirm(r.status === 'sent' ? 'この記録を消しますか？（預けたメモは消えません）' : '録音と文字を消します。よろしいですか？')) { await dbDel(r.id); recs = recs.filter(x => x.id !== r.id); render(); } }
   else if (d.use) { const r = recs.find(x => x.id === d.use), pv = previews[d.use]; if (r && pv) { if (pv.kind === 'title') r.title = pv.text.split('\n')[0].slice(0, 60); else r.text = pv.text; previews[d.use] = null; await dbPut(r); render(true); } }
