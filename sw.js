@@ -1,7 +1,19 @@
-// voice-pad の SW: 画面を開けるようにするだけ。通信(Worker宛・POSTなど)には触れない。
-// 画面を変えたら、下の CACHE の数字を1つ上げる（更新が早く届く）。
-const CACHE = 'voice-pad-v1';
+// voice-pad の SW: 画面表示を保ちつつ、flow-hub の活動トラッカーをHTMLへ注入する。
+const CACHE = 'voice-pad-v2';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png'];
+const HUB_SCRIPT = '<script src="./hub-activity.js"></script><script src="./hub-handoff.js"></script>';
+
+async function instrument(res) {
+  const type = res.headers.get('content-type') || '';
+  if (!type.includes('text/html')) return res;
+  const text = await res.text();
+  if (text.includes('hub-activity.js')) return new Response(text, {status:res.status, headers:res.headers});
+  const body = text.replace(/<\/body>/i, HUB_SCRIPT + '</body>');
+  const headers = new Headers(res.headers);
+  headers.delete('content-length');
+  return new Response(body, {status:res.status, statusText:res.statusText, headers});
+}
+
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => Promise.all(SHELL.map(u => c.add(new Request(u, { cache: 'reload' })).catch(() => {})))).then(() => self.skipWaiting()));
 });
@@ -10,6 +22,14 @@ self.addEventListener('activate', e => {
 });
 self.addEventListener('fetch', e => {
   const req = e.request, url = new URL(req.url);
-  if (req.method !== 'GET' || url.origin !== self.location.origin) return;   // Worker宛・POST は素通し
-  e.respondWith(fetch(req).then(res => { if (res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); } return res; }).catch(() => caches.match(req, { ignoreSearch: true })));
+  if (req.method !== 'GET' || url.origin !== self.location.origin) return;
+  e.respondWith(fetch(req).then(async res => {
+    if (!res.ok) return res;
+    const out = await instrument(res.clone());
+    caches.open(CACHE).then(c => c.put(req, out.clone()));
+    return out;
+  }).catch(async () => {
+    const cached = await caches.match(req, {ignoreSearch:true});
+    return cached || fetch(req);
+  }));
 });
